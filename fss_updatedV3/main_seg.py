@@ -27,8 +27,8 @@ import Metrics
 # ─────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────
-VOC_ROOT            = "./data/fss-data/VOCdevkit/VOC2012"  # ← CHANGE THIS
-FOLD                = 0
+VOC_ROOT            = "./data/fss-data/VOCdevkit/VOC2012" 
+NUM_FOLDS           = 4  # ← Run all 4 folds
 K_SHOT              = 5
 BACKBONE_NAME       = "resnet50"
 DECODER_CHANNELS    = 256   # FPN output channels — 256 is standard
@@ -39,51 +39,17 @@ DECODER_LR          = 0.001   # can set higher e.g. 0.005 since decoder is rando
 IMG_SIZE            = 224
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device} | Backbone: {BACKBONE_NAME} | {K_SHOT}-shot | Fold {FOLD}")
+print(f"Device: {device} | Backbone: {BACKBONE_NAME} | {K_SHOT}-shot")
 print(f"Decoder: FPN, out_channels={DECODER_CHANNELS}")
+print(f"Running {NUM_FOLDS} folds...")
 
 # ─────────────────────────────────────────────────────────────────
-# Data — UNCHANGED from previous version
+# Data — Will be loaded per-fold in the main loop
 # ─────────────────────────────────────────────────────────────────
-train_loader, val_loader, NUM_BASE = Data_Loader.prepare_base_loaders(
-    voc_root=VOC_ROOT, fold=FOLD, batch_size=BATCH_SIZE
-)
-novel_dataset, novel_classes = Data_Loader.prepare_novel_dataset(
-    voc_root=VOC_ROOT, fold=FOLD
-)
+# (Moved inside the fold loop below)
 
-# ─────────────────────────────────────────────────────────────────
-# Model — CHANGED: backbone returns feat_dims dict, decoder added
-# ─────────────────────────────────────────────────────────────────
-backbone, feat_dims = Models.load_backbone(BACKBONE_NAME)
-# feat_dims = {'feat2': 512, 'feat3': 1024, 'feat4': 2048}
-
-model = APM.SegAPM(
-    backbone            = backbone,
-    num_base_classes    = NUM_BASE,
-    decoder_out_channels= DECODER_CHANNELS,
-).to(device)
-
+# Global loss criterion (used in compute_batch_loss)
 criterion = nn.CrossEntropyLoss(ignore_index=255)
-
-# ── CHANGED: separate param groups for backbone vs decoder ──────
-# Backbone layer4 — pretrained, use lower LR
-# Decoder         — random init, can use same or slightly higher LR
-optimizer = optim.Adam([
-    {
-        "params": model.backbone.layer4.parameters(),
-        "lr": LEARNING_RATE,
-        "name": "backbone_layer4"
-    },
-    {
-        "params": model.decoder.parameters(),
-        "lr": DECODER_LR,
-        "name": "decoder",
-        "weight_decay": 1e-4   # ← add this — L2 regularization on decoder weights
-    },
-])
-
-scheduler = StepLR(optimizer, step_size=1, gamma=0.30)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -294,16 +260,75 @@ def phase3_test(novel_classes, query_data):
 
 
 # ─────────────────────────────────────────────────────────────────
-# RUN
+# RUN — Loop over all folds
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    phase1_val_miou = phase1_train()
-    query_data      = phase2_adapt(novel_dataset, novel_classes, K_SHOT)
-    novel_miou      = phase3_test(novel_classes, query_data)
+    fold_results = []
 
-    print("\n" + "="*60)
-    print("  FINAL RESULTS (with FPN decoder)")
-    print("="*60)
-    print(f"  Phase 1 val mIoU  (base)  = {phase1_val_miou*100:.2f}%")
-    print(f"  Phase 3 mIoU      (novel) = {novel_miou*100:.2f}%")
-    print(f"  Setting: Fold={FOLD} | {K_SHOT}-shot | {BACKBONE_NAME} + FPN")
+    for fold in range(NUM_FOLDS):
+        print(f"\n\n{'#'*70}")
+        print(f"#  STARTING FOLD {fold}")
+        print(f"{'#'*70}\n")
+
+        # Reload data for this fold
+        train_loader, val_loader, NUM_BASE = Data_Loader.prepare_base_loaders(
+            voc_root=VOC_ROOT, fold=fold, batch_size=BATCH_SIZE
+        )
+        novel_dataset, novel_classes = Data_Loader.prepare_novel_dataset(
+            voc_root=VOC_ROOT, fold=fold
+        )
+
+        # Recreate model for this fold
+        backbone, feat_dims = Models.load_backbone(BACKBONE_NAME)
+        model = APM.SegAPM(
+            backbone            = backbone,
+            num_base_classes    = NUM_BASE,
+            decoder_out_channels= DECODER_CHANNELS,
+        ).to(device)
+
+        optimizer = optim.Adam([
+            {
+                "params": model.backbone.layer4.parameters(),
+                "lr": LEARNING_RATE,
+                "name": "backbone_layer4"
+            },
+            {
+                "params": model.decoder.parameters(),
+                "lr": DECODER_LR,
+                "name": "decoder",
+                "weight_decay": 1e-4
+            },
+        ])
+
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.30)
+
+        # Run phases for this fold
+        phase1_val_miou = phase1_train()
+        query_data      = phase2_adapt(novel_dataset, novel_classes, K_SHOT)
+        novel_miou      = phase3_test(novel_classes, query_data)
+
+        result = {
+            "fold": fold,
+            "phase1_miou": phase1_val_miou,
+            "phase3_miou": novel_miou
+        }
+        fold_results.append(result)
+
+        print("\n" + "="*60)
+        print(f"  FOLD {fold} RESULTS (with FPN decoder)")
+        print("="*60)
+        print(f"  Phase 1 val mIoU  (base)  = {phase1_val_miou*100:.2f}%")
+        print(f"  Phase 3 mIoU      (novel) = {novel_miou*100:.2f}%")
+        print(f"  Setting: Fold={fold} | {K_SHOT}-shot | {BACKBONE_NAME} + FPN")
+
+    # Print summary across all folds
+    print(f"\n\n{'='*60}")
+    print("  SUMMARY ACROSS ALL FOLDS")
+    print(f"{'='*60}")
+    for res in fold_results:
+        print(f"  Fold {res['fold']} | Phase1={res['phase1_miou']*100:.2f}% | Phase3={res['phase3_miou']*100:.2f}%")
+    
+    avg_phase1 = sum(r['phase1_miou'] for r in fold_results) / len(fold_results)
+    avg_phase3 = sum(r['phase3_miou'] for r in fold_results) / len(fold_results)
+    print(f"\n  Average Phase 1 mIoU (base)  = {avg_phase1*100:.2f}%")
+    print(f"  Average Phase 3 mIoU (novel) = {avg_phase3*100:.2f}%")
